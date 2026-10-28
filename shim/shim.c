@@ -379,7 +379,7 @@ void shim_main(uint64_t dtb)
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "fajita milestone 4: xnu loader");
+	con_str("SHIM", "enchilada milestone 4: xnu loader");
 	con_skip();
 	tree = fdt_locate(dtb);
 	con_hex("DTB abl", dtb);
@@ -414,7 +414,7 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
-	con_str("SHIM", "fajita milestone 3");
+	con_str("SHIM", "enchilada milestone 3");
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	fdt_print_memory(dtb);

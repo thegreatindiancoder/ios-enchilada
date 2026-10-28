@@ -383,7 +383,7 @@ never written, `userdata` written once.
 | Step | Goal | Flashes | Success | Rollback |
 | --- | --- | --- | --- | --- |
 | 0 | Done: root facts, bootloader driver, `fastboot getvar all` (unlocked, both slots successful, retry 7/6). Partition backups were declined by the owner: rollback = slot `b` + MSM tool. Left: WSL + `tools/setup-wsl.sh --wsl-kernel` (§8), a recovery image for enchilada that `fastboot boot`s (the crDroid recovery is the candidate), copy of Android user data before step 2b | 0 | the shim builds in WSL | — |
-| 1 | Diagnostic shim without payload: `FB_H=2280 SHIM_HDR=1 DTB=$(realpath dtb/boot_b_unpacked/enchilada2.dtb) shim/build.sh` → paints the console, prints the live memory nodes and the read-only UFS probe | 0 if `fastboot boot` works; else 1 (`boot_a` + `--set-active=a`) | text on the panel, memory nodes = §1, UFS `rc 0` | `fastboot --set-active=b` |
+| 1 | **Done 2026-10-28.** Diagnostic shim without payload: `FB_H=2280 SHIM_HDR=1 DTB=$(realpath dtb/boot_b_unpacked/enchilada2.dtb) shim/build.sh` → `fastboot boot` accepted, console text on the panel, self-reset returns to Android | 0 | text on the panel | — |
 | 2a | Kernel from CI + `BOARD_ENV=tools/enchilada.env tools/build-fajita.sh` (ADT with `--fb-h=2280`, the measured DRAM size, conservative boot-args from §3.7), no root yet | 0–1 (`boot_a`) | early console, `SWEET UFS` finds `userdata`, stops at the root mount with a clear message; no reset at ~150 s | same |
 | 2b | iOS root image (`tools/mkiosroot.sh` + `sweet-root-tweaks.py`, WSL) → `fastboot -S 512M flash userdata` | 1 (userdata, destructive) | HFS+ mounts, launchd starts, Apple logo, 10–15 min migration, lock screen with the console on | Android reinstall of data only; system stays in slot b |
 | 3 | Input: HID geometry fix (§3.2), `sweetkeys=1` after `sweetkeysprobe=1`, `sweetts=1` with `sweettouchdelay`, raw range from the log | 1 per kernel (`boot_a`) | unlock swipe, home screen, buttons | same |
@@ -438,15 +438,225 @@ The repo must stay LF (`core.autocrlf=false`), otherwise the shell scripts break
 
 ## 9. Open questions (answered by steps 0–2)
 
-1. Does this ABL accept `fastboot boot`? (`unknown command` → flash `boot_a` + `--set-active=a`.)
-2. Does the APCS watchdog reset the OP6 at ~150 s with the fajita kernel?
-3. Does `/pram` at the top of the DRAM range work here as on the 6T, or only 0x100000000?
-4. Raw touch range of this unit's sensor; key PPIDs (first kernel boots).
-5. A recovery for enchilada that boots with `fastboot boot` and gives adb root (TWRP by Nebrassy;
+1. Does the APCS watchdog reset the OP6 at ~150 s with the fajita kernel?
+2. Does `/pram` at the top of the DRAM range work here as on the 6T, or only 0x100000000?
+3. Raw touch range of this unit's sensor; key PPIDs (first kernel boots).
+4. A recovery for enchilada that boots with `fastboot boot` and gives adb root (TWRP by Nebrassy;
    the crDroid recovery image at hand is the first candidate to test).
+
+Step 1 result (2026-10-28): `fastboot boot shim/out/shim-boot.img` (434176 B, header v1, `FB_H=2280`,
+`enchilada2.dtb`) was accepted by this ABL (`Booting OKAY`), the shim's console text appeared on the
+panel, and the shim's self-reset brought the phone back to Android (the "reboot to bootloader"
+request is ignored, no 900E). So `fastboot boot` works on this firmware and no `boot_a` write is
+needed before the iOS root.
+
+Steps 2a, 2b and 3 result (2026-10-29): the 6T CI kernel (patch series through 0171, merged
+into this tree) booted on the OnePlus 6 from `BOARD_ENV=tools/enchilada.env tools/build-fajita.sh`
+(ADT `fb-h` 2280, the phone's own SoC v2.1 DTB, `ARENA_MIB=1`). Without a root it stopped at
+`cannot mount root, errno = 19` (the UFS driver found `userdata`, the volume was Android's) and ran
+247 s until it was rebooted by hand: open question 1 is answered (no APCS watchdog reset on this
+unit with this kernel) and so is question 2 (`/pram` at the top of DRAM works as on the 6T). After
+the one confirmed write, `fastboot -S 512M flash userdata` of the 12.1 GB sparse root, the first
+boot with `sweetfb_console=1` started the whole daemon set with the console on the panel;
+`sweetfb_console=1` means console only (`AppleCLCD::present()` returns early), so the GUI needs
+`sweetfb_noconsole=1` instead. With that and `cpus=1` the Apple logo and then the lock screen
+appeared after the one-time data migration (about 15 min); with
+`cpus=8 sweetsmp=1 sweetkeys=1 sweettouch=1 sweetts=1 sweettouchdelay=20` the boot takes minutes,
+touch, power and volume keys work, and Settings is usable. Seen on that boot: touch lands up to
+30 px off and misses the bottom-edge gestures, because the HID and RMI4 code assumed 2340 rows
+while the compositor uses the boot video's 2280 (patch 0173 takes both from the boot video; the
+sensor's raw range is still to be read from the `SWEET TS: raw max` log line); the 0079 display-off
+fade is visibly stepped at `sweetfb_hz=10`; after a large `userdata` flash fastboot reports the
+device as `????????????` until the USB cable is re-plugged. No rollback was needed; Android in
+slot `b` is untouched.
 
 Answered on 2026-10-28 from the phone: the memory map (identical to the 6T unit), the panel
 (`sofef00_m_cmd`, 1080×2280, command mode, no DSC), the lock state (`unlocked: yes`, critical
 locked), the slot state (both successful, retry counters 7/6 — a slot that never reports success
 loses one per boot and ABL switches at zero; `fastboot --set-active=a` re-arms it), the DTB table
 and the `dtbo` selection, the GPU firmware location, the partition layout and sizes.
+
+## 10. What postmarketOS and the neighbouring projects can give us (assessed 2026-10-28)
+
+The README's "does not work yet" list, item by item, against what mainline Linux on this exact
+phone knows (postmarketOS `device-oneplus-enchilada`, kernel `linux-postmarketos-qcom-sdm845`
+from `sdm845-mainline/linux`) and what the other iOS-on-Qualcomm trees have reached. Rule of
+thumb: Linux gives us **facts** (firmware names, rails, GPIOs, register maps, memory regions,
+which blob depends on which) and never code: every driver has to be an XNU/IOKit one. The
+iOS-on-Android trees give us **code and proven routes**, because they run the same userland.
+
+Sources read: pmaports APKBUILDs and `firmware.files`; `sdm845.dtsi`,
+`sdm845-oneplus-common.dtsi`, `sdm845-oneplus-enchilada.dts`; `drivers/rtc/rtc-pm8xxx.c`;
+`drivers/gpu/drm/msm/adreno/a6xx_catalog.c`; Mesa `freedreno_devices.py` and
+`meson_options.txt`; the Mobian OnePlus 6 wiki; `NOTES-FAJITA.md` for the GPU state;
+the READMEs, release notes and `docs/` of Chlorophyll/Bergamota, hackios, ios-flame, UniXNU.
+
+### 10.1 Hardware acceleration: the gap is userspace Metal, and it is board-independent
+
+Where the port stands (6T journal, 2026-10-27/28, verified on a 6T): the Adreno 630 kernel
+driver is complete (GMU, zap through TZ, SMMU, CP, buffers, fences) behind an msm-compatible
+IOKit user client (`SweetAdreno630`); iOS 16.7.16's Metal **does** load a third-party device
+bundle named by an `IOAcceleratorES` service (`MetalPluginName`) and calls
+`-initWithAcceleratorPort:` from backboardd; Chlorophyll's `libbgair.dylib` (Mesa 25.0.7
+freedreno + the AIR→NIR→ir3 front end) and the libdrm stand-in cross-build on Linux
+(`tools/mesa-ios/README.md`); the in-process test `bgmtl-adddev` opens the GPU, gets the MSM
+params (0168 fixed their numbering), creates a submitqueue, allocates small buffers and stopped
+at the first 4 MiB buffer, which 0169–0171 answer (payload arena up to ~40 MiB in 1 MiB windows,
+big buffers without a kernel alias). The 6T tree also assessed `oosexgang/hakios-metal`, a C++
+Metal command model (queues, command buffers, CP blits, a strict PM4 fake GPU for tests, a
+`.metallib` parser) that speaks the same msm request numbers over IOKit and lacks exactly what
+`libbgair` has: shaders.
+
+None of this depends on the board. The OnePlus 6 has the same GPU (chip id 0x06030001), the
+same `gpu_region`/`cont_splash` carve-outs, the same `a630_gmu.bin`/`a630_sqe.fw` and the same
+OEM-signed `a630_zap.*` in `/vendor/firmware` (checked on this unit, §1). For enchilada the GPU
+plan is therefore: **merge `fajita/main` as it advances and keep the GPU series untouched**;
+our board work is the compositor's geometry (2280 rows, §3.1), not the GPU.
+
+Two routes exist among the neighbours, and both are proven on real phones:
+
+| Route | Who | iOS | State |
+| --- | --- | --- | --- |
+| A. Gallium freedreno + own `_MTLDevice` (`bgmtl`, AIR→NIR→ir3) | Chlorophyll/Bergamota (Poco F1, A630), followed by ios-fajita | 18.7.8 (them), 16.7.16 (fajita) | backboardd/SpringBoard/PosterBoard composited on the GPU, ~45 fps home swipe (Bergamota milestone 2026-10-25); on 16.7.16 the plugin loads, the device test is being iterated |
+| B. Turnip (Vulkan) + `metal2vulkan` (Metal API on Vulkan) | ios-flame (Pixel 4, A640, **iOS 16.7.16**), UniXNU (SM8550, iPadOS 17), Chlorophyll `ios26` branch | 16.7.16 | backboardd + SpringBoard + apps on the GPU at 20–26 fps (`sweetmtl=2`); Chlorophyll measured 5–7.5 µs/draw on Turnip vs 100–200 µs on its Gallium path and rewrote its device onto Turnip |
+
+Both routes sit on the same kernel ABI (msm-style submits over IOKit, BOs mapped with
+`IOConnectMapMemory64`), so the kernel work already done serves either. Route A is what the
+6T tree is on and shares the most code with us; route B is the one proven on **our exact iOS
+build** with the whole UI on the GPU, and Mesa's Turnip has a KGSL backend
+(`tu_knl_kgsl.cc`) and a virtio one next to msm, i.e. a cleaner place to plug an IOKit transport
+than faking DRM ioctls (Gallium freedreno has only msm and virtio; its KGSL branch is dead
+code). Decision for this port: follow fajita on route A (no fork), and keep ios-flame's
+`metal2vulkan` + Turnip as the measured alternative if the `bgmtl` device stalls; read
+ios-flame's `sweetmtl` glue and UniXNU's `AGXDeviceUserClient` admission trick before that.
+
+What Linux (pmOS/Mesa) adds to the GPU work is small but real:
+
+- Mesa's a630 entry: `highest_bank_bit 15` (UBWC swizzle), gmem 1 MiB, tile align 32×16, quirks
+  `indirect_draw_wfm`, `draw_auto_stale_stride`, `predicated_binning`,
+  `depth_bounds_require_depth_test`; `libbgair` compiles these in. If a pass renders wrong, the
+  knobs to mimic are `FD_MESA_DEBUG=sysmem|gmem|nobin|noubwc|nolrz` and `IR3_SHADER_DEBUG`.
+- The zap blob is per-OEM signed (linux-firmware ships 0.19 generic and 0.20 SHIFT); the phone's
+  own `a630_zap.mdt/.b0x` is the right one, never linux-firmware's.
+- a6xx catalog quirk `HAS_CACHED_COHERENT`: Linux maps GPU buffers cached-coherent on a630; our
+  arena is non-cacheable (MAIR attr 0). First thing to revisit when Metal works but is slow.
+- Known a630 compositor artefacts (Mesa issues 7700, 10466) were fixed by forcing gmem or using
+  Zink: tiles/stale strips are a known class, not a new bug.
+
+Not reusable: msm DRM/KMS, Linux's GMU/PAS code (ours works), pmOS packaging.
+
+`.metallib` is not a blocker: the UI ships its own metallibs (QuartzCore `default.metallib`
+etc., 5 libs / 456 modules on an iOS 16.5 root per hackios' corpus; the AIR front end already
+reads them), only *test* shaders need a compiler, and GitHub's `macos-14` runners have Xcode
+(`xcrun -sdk iphoneos metal`). Apple's Metal Developer Tools for Windows also produce iOS
+metallibs on this PC without a Mac.
+
+Next steps for GPU on enchilada, in order: (1) merge `fajita/main` (clean merge checked
+2026-10-28); (2) boot with the ladder on (`adreno=9 zap=1 gpuhold=1`) and confirm the same
+`RBBM_STATUS`/fence lines in our log, a one-boot regression check; (3) carry the 6T Metal
+iteration (payload-delivered userspace, `bgmtl` device, hakios command model) as patches on the
+same series, never a fork; (4) if it stalls, route B with ios-flame's glue.
+
+### 10.2 Wi-Fi (WCN3990): the modem is in the way, but two trees already got past it
+
+Facts from `sdm845.dtsi` + the OnePlus dtsi: `wifi@18800000`, `qcom,wcn3990-wifi`, SNOC bus,
+12 IRQs (SPI 414–425), `iommus = <&apps_smmu 0x0040 0x1>`, `memory-region = wlan_msa_mem`
+(our `wlan_fw_region@8df00000`, 1 MiB), clock `RPMH_RF_CLK2`, rails from the `wcn3990-pmu`
+node (swctrl PM8998 GPIO3, vddio S4A 1.8 V, vddxo L7A, vddrf L17A 1.3 V, vddch0 L25A,
+vddch1 L23A, cx/mx L5A 0.8 V), board variant `oneplus_sdm845`,
+`qcom,snoc-host-cap-8bit-quirk`. Firmware: `ath10k/WCN3990/hw1.0/firmware-5.bin`,
+`board-2.bin` entry `bus=snoc,qmi-board-id=ff,qmi-chip-id=30214,variant=oneplus_sdm845`, and
+`wlanmdsp.mbn`, which the host does **not** load: the modem DSP fetches it over `tqftpserv`
+after the MPSS is booted with `mba.mbn` + `modem.mbn`; the driver then speaks QMI over QRTR to
+the firmware. On Linux, Wi-Fi therefore needs the modem remoteproc, `rmtfs` (serving
+`modemst1/modemst2/fsg` read-only), `pd-mapper`, `tqftpserv` and QRTR.
+
+Neighbours: **ios-flame** (Pixel 4, the same WCN3990, iOS 16.7.16) has Wi-Fi from a userland
+daemon `wland` (scan, WPA2-PSK, `wifid` sees `en0`); **hackios** (SD778G) runs Linux's ath11k
+inside XNU through a LinuxKPI shim and has Wi-Fi in Safari. So the route exists on our userland:
+userland or LinuxKPI driver + a fake `en0` that `wifid`/`configd` accept. What to read first is
+how ios-flame boots (or avoids) the MPSS for `wlanmdsp.mbn`; that answers whether Wi-Fi here
+needs 10.4 or not. Reusable from Linux: every name and number above, the rail sequence, and the
+fact that the calibration/NV lives in the EFS partitions we never write.
+
+### 10.3 Bluetooth: the smallest radio
+
+Facts: `uart6` (`serial@898000`, QUP GENI, 4-pin), child `qcom,wcn3990-bt`, `max-speed 3200000`,
+rails from the same `wcn3990-pmu` LDOs, firmware `qca/crbtfw21.tlv` (generic patch file) +
+`qca/crnv21.bin` (per-device NVM; Android keeps it in `/vendor/bt_firmware/image/`). No
+provisioned BD address (Linux falls back to `00:00:00:00:5a:ad` unless userspace sets one; pmOS
+`bootmac`). Plain HCI H4 over UART with Qualcomm's `btqca` download sequence (`hci_qca.c`).
+
+Consequence: a GENI UART driver + the btqca download + an HCI transport is a self-contained job
+and does **not** need the modem. The unknown is whether iOS 16's `bluetoothd` accepts a
+non-Apple transport (it crash-loops today for unrelated reasons, 6T journal). No neighbour has
+Bluetooth yet.
+
+### 10.4 Modem: the key to Wi-Fi (maybe), GPS and the clock; large
+
+Facts: `mss_pil` (`qcom,sdm845-mss-pil`), `mba.mbn` + `modem.mbn` from the phone, `ipa_fws.mbn`
+for IPA, `rmtfs_mem` at 0xf5b00000 (0x202000, `qcom,vmid MSS_MSA`, guard pages),
+`removed-region@88f00000` (0x1c00000) must stay reserved or the modem crashes, daemons
+`rmtfs -P -r -s` + `pd-mapper` + `tqftpserv` + `qrtr-ns`, then QMI (libqmi/ModemManager over
+QRTR, not RPMSG); call audio needs `q6voiced` (ADSP). Camera, Wi-Fi and sensors (SLPI/FastRPC)
+hang off the same PAS/remoteproc machinery. hackios boots the modem but has no registration.
+
+Consequence for XNU: no path to Apple's `CommCenter`; the realistic goal is remoteproc + QRTR +
+QMI for Wi-Fi's sake and the time of day, not telephony. Order if ever: PAS loader (we already
+do PAS for zap), SMEM/SMP2P/GLINK, QRTR, rmtfs (read-only!), tqftpserv, then 10.2.
+
+### 10.5 Camera: not reusable
+
+Mainline has `camss@acb3000` for SDM845, but the enchilada sensors (front `imx371`, rear
+`imx519` + `imx376k`, VCM `lc898217xc`) are only commented out in the OnePlus dtsi; the working
+camera is a 6.12+/6.18+ downstream series. Only the CCI/I²C map is worth keeping. Apple's camera
+stack would not take a non-Apple ISP anyway. Skip.
+
+### 10.6 Time (the 1969 clock): cheap, and the right first fix after boot
+
+Facts (`rtc-pm8xxx.c`, `qcom,pm8941-rtc`, PM8998 SID 0): RTC_RW peripheral at 0x6000, alarm at
+0x6100; `ctrl 0x6046` (bit 7 RTC enable), `write 0x6040`, **`read 0x6048..0x604b` = seconds,
+little-endian, read twice to catch the LSB carry**; alarm `rw 0x6140`, `ctrl 0x6146`,
+`ctrl2 0x6148`. On production phones the write registers are TZ-protected, so the counter is
+"seconds since the PMIC was last reset" and Linux keeps an epoch offset elsewhere; the OnePlus
+DT has no `allow-set-time`, no nvmem offset and no UEFI `RTCInfo`, so postmarketOS reads the raw
+counter and fixes it in userspace (`swclock-offset`: store hwclock−swclock at shutdown, re-apply
+at boot). Android's `time_daemon` does the same with `/persist/time/ats_*`. ios-flame already
+reads its PM8150 RTC the same way.
+
+The port already has `sweet_spmi_read(sid, addr, &byte)` (patch 0062, battery). So:
+
+1. kernel: read the four bytes at 0x6048 (twice), feed them to XNU's calendar as the RTC
+   seconds — one small patch;
+2. offset: boot-arg `sweetepoch=<unix seconds of the image build>` as the floor, plus a file in
+   the HFS+ root (`/private/var/db/.sweet-clock-offset`, written whenever userspace sets the
+   time) holding `unix − rtc`; the kernel applies floor and offset at boot;
+3. never write the RTC.
+
+Result: a monotonic, correct-to-the-minute clock after one `date`/NTP; "certificate not yet
+valid" failures stop. No board risk, no phone writes.
+
+### 10.7 Apple security stand-ins: nothing to borrow
+
+AMFI/sandbox/codesign permissiveness is a design choice of the port, unrelated to Linux. Leave.
+
+### 10.8 Display facts worth keeping (not needed for the bring-up)
+
+`panel-samsung-sofef00.c` (compatible `samsung,sofef00-ams628nw01`) drives this exact panel
+from mainline: 1080×2280@60, hfp/hs/hbp 112/16/36, vfp/vs/vbp 36/8/12, 4 lanes RGB888,
+**video burst mode** upstream (ABL runs it in command mode), rails vddio L14A 1.88 V, vci
+GPIO26-gated 3.3 V, poc GPIO25, reset TLMM 6 active-low, TE TLMM 10, DCS brightness. The 6T is a
+different panel and driver (`s6e3fc2x01`, 2340 rows). If the port ever needs to re-init the
+panel after the ABL hand-over (display off/on, brightness), this file is the init sequence;
+Linux inherits the same `simple-framebuffer` on `cont_splash_mem` with stride 4320.
+
+### 10.9 Where this leaves the priorities
+
+| Item | Borrowable | Size under XNU | When |
+| --- | --- | --- | --- |
+| GPU acceleration | Linux: a630 quirks only. Neighbours: the whole userspace (fajita/Chlorophyll route A, ios-flame route B) | large, in progress upstream | now: merge `fajita/main`, track |
+| Clock | PM8998 RTC map + offset-file idea; ios-flame precedent | small | right after the first iOS boot |
+| Bluetooth | UART/btqca/firmware facts | medium, modem-free | after GPU |
+| Wi-Fi | ath10k SNOC facts; ios-flame `wland`, hackios LinuxKPI | large | after reading ios-flame's modem answer |
+| Modem (QRTR/QMI only) | memory map, daemons, PAS facts | large | later |
+| Camera | nothing usable | — | never (here) |
