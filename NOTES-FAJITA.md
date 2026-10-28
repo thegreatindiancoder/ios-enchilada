@@ -3266,3 +3266,211 @@ Rules from now on:
 Full `userdata` flash of the current image is the safe path, and the image already contains
 `/usr/local/lib/{libbgair.dylib,libdrm.2.dylib}` (dyld searches `/usr/local/lib`; `@rpath` expansion
 is blocked by AMFI on this port: "security policy does not allow @ path expansion").
+
+### 2026-10-28: the Metal test runs; and why root-fs iteration must move to the payload
+
+`bgmtl-adddev` finally loads (dylibs found in `/usr/local/lib`) and prints:
+
+```
+SWEET METAL: bgmtl_adddev starting
+MTLAddDevice symbol: 0x1cf7b3368
+CRASH bgmtl-adddev sig 11 … pc 0x0
+```
+
+`pc 0x0` is their test calling `dlsym(RTLD_DEFAULT, "MTLCopyAllDevices")` without a NULL check:
+**iOS 16 has no `MTLCopyAllDevices`** (macOS-only). The wrapper now resolves all three symbols, prints
+all three pointers and guards every call, so the next run says which of them exist on 16.7.16.
+
+Iteration cost is now the real problem. After a full `userdata` flash iOS mounts the root read-write
+(`rootrw=1`) and writes to it (journal, `/var`, caches), so the BASE image no longer describes the
+device and a block push would clobber or desynchronise the volume - that is exactly how the previous
+`mount[7] … exit status 74` came about. Each userspace iteration therefore costs ~12 min of sparse +
+fastboot and ~12 min of iOS migration.
+
+The way out (next infrastructure step, one more `userdata` flash, then never again):
+
+1. put the files that change (the test binary, `libbgair`, `libdrm`, later the real bundle) into the
+   **boot payload** - `boot_a` is 18 MB and flashes in under a second;
+2. expose the payload to userspace from the kernel (one chardev ioctl: read N bytes at offset O from
+   the payload blob - the machinery to map the blob already exists for the GPU);
+3. install, once, a small loader in the root (`/usr/local/bin/sweet-install`) that reads a simple
+   TOC+data archive from the payload and writes the files into `/usr/local/lib` and
+   `/usr/local/bin` at boot, before `DumpPanic` hands over to the test.
+
+After that, every change to the Metal userspace is `boot_a` only (~1 min, no migration), and the
+root image is only needed for the loader itself. Worth doing before the `bgmtl` iteration starts for
+real, because that iteration will be many rounds.
+
+### 2026-10-28: the submitqueue failure was a wrong MSM param number
+
+Mesa died with `could not create submitqueue! -22` and `fd_pipe_new2: allocation failed`, so
+`bgmtl_create_device()` returned nil even though the GPU opened ("GPU ready (kernel ABI minor 0)").
+
+Root cause: our `GPU_PARAM_*` numbers were offset from libdrm's `MSM_PARAM_*`. Mesa asks through
+libdrm, so a wrong number is not a missing answer but a wrong one:
+
+| Mesa asks | msm id | we answered |
+|---|---|---|
+| `MSM_PARAM_GMEM_SIZE` | 2 | `CHIP_ID` |
+| `MSM_PARAM_CHIP_ID` | 3 | `GMEM_SIZE` |
+| `MSM_PARAM_PRIORITIES` | 7 | `VA_START` = 0x80000000 |
+| `MSM_PARAM_VA_START` | 0x0e | `VA_SIZE` |
+
+`fd_pipe_get_param(FD_NR_PRIORITIES)` therefore returned 0x80000000, freedreno kept `prio = 1`
+(its `fd_pipe_new()` asks for 1 unconditionally), and our submitqueue handler refused anything but
+`prio == 0` with `kIOReturnBadArgument` -> -22.
+
+`0168`: the table now matches msm exactly (`GMEM_SIZE 2`, `CHIP_ID 3`, `PRIORITIES 7`,
+`PP_PGTABLE 8`, `VA_START 0x0e`, `VA_SIZE 0x0f`), `PRIORITIES` answers 1 and `PP_PGTABLE` 0, and
+the submitqueue handler accepts the priority and the preempt hint bit (logging both) instead of
+insisting on 0. One ring means the priority is meaningless here.
+
+Also confirmed on this boot: iOS 16.7.16 has `MTLAddDevice` and `MTLCreateSystemDefaultDevice` but
+**no `MTLCopyAllDevices`**.
+
+### 2026-10-28: Mesa needs more than the 1 MiB arena (0169)
+
+With `0168` freedreno got all the way through pipe creation and buffer allocation, then stopped at
+the first large buffer:
+
+```
+MESA: warning: bo_new(4194304): kernel refused; caches emptied, retry failed
+CRASH bgmtl-adddev sig 11
+```
+
+Our arena is the 1 MiB `sweetfw2` payload blob and `sweet_gpu_alloc_pages()` refuses anything bigger
+than it. Metal/CA needs many MiB for buffers, textures and shader storage, so the arena becomes the
+general GPU memory:
+
+- `build-fajita.sh`: `ARENA_MIB` (default 64) sizes the blob. It travels in the payload, so a bigger
+  arena costs boot-image size and a `boot_a` flash - **not** a `userdata` flash;
+- `0169`: the kernel no longer assumes exactly 1 MiB - it takes the size the payload announces
+  (1 MiB minimum, 256 MiB cap), maps that much and sets `gpu_arena_size` accordingly;
+  `GPU_BO_MAX_BYTES` rises from 1 MiB to 64 MiB.
+
+This is still the payload-memory shortcut, not a real allocator: the day we need more than
+`ARENA_MIB`, either raise it (RAM cost) or fix the VM properly (pages below `gPhysBase` panic in
+pmap - option 2 in the 2026-10-26 entry).
+
+### 2026-10-28: the arena cannot be mapped in one piece - kernel_map has no 40 MiB hole
+
+`console104` (arena 64 MiB) never flashed: `FAILED (remote: 'Error flashing partition : Volume
+Full')` - `boot_a` is exactly 64 MiB (`0x4000000`), and with the current kernel the image overhead is
+~17.7 MB, so the payload arena can be at most ~40 MiB. `console105` used that 40 MiB and booted into
+a panic instead:
+
+```
+panic(cpu 0 caller 0xfffffe0007ad5d48): kmem_alloc(0xfffffe10035cadf0, 41943040, 0x100021):
+  failed with 3 @vm_kern.c:170
+```
+
+`ml_io_map()` of the whole arena is a single `kmem_alloc()` of its size, and this port's
+`kernel_map` has no 40 MiB contiguous hole (the biggest mapping that has ever succeeded here is the
+1 MiB arena). So a bigger arena needs either:
+
+1. **chunked mapping**: map the arena in windows (2 MiB / 4 MiB) and make every buffer live inside a
+   single window - the four `gpu_arena + off` uses are easy to convert, but a BO larger than the
+   window then needs its own rule (this is the cheap path, and 4 MiB is what freedreno asked for);
+2. **the real allocator**: allocate GPU pages from the VM and map them with pmap ourselves, i.e. fix
+   option 2 from the 2026-10-26 entry (pages below `gPhysBase` panic in pmap; that is the reason the
+   payload arena exists at all).
+
+State of the Metal path at this point: `bgmtl` opens the GPU (INFO with the 40-byte struct), gets the
+five parameters, creates a submitqueue (`submitqueue_new flags 0 prio 0`), allocates small BOs and
+closes them - and stops at the first 4 MiB buffer, which the 1 MiB arena refuses. The work left is
+memory, not protocol: every selector Mesa touches so far is answered correctly.
+
+The phone was returned to `console103-params` (0168, 1 MiB arena), which boots and shows the UI.
+
+### 2026-10-28: the arena mapped in windows (0170) - and what its first boot answers
+
+`ml_io_map()` wants one contiguous `kmem_alloc()` for the whole arena; this port's `kernel_map` has
+no 40 MiB hole, and the largest mapping that has ever worked here is 1 MiB - so the ceiling is
+unknown and worth measuring instead of guessing.
+
+`0170`: at init the kernel tries to map the first arena window at 16, 8, 4, 2 and 1 MiB, keeps the
+largest that maps, logs it, and then maps the rest of the arena in windows of that size. The bump
+allocator keeps every buffer inside a single window (a buffer's kernel alias must be contiguous) and
+refuses anything larger than a window, which caps a buffer at the window size. `gpu_arena_kva(off)`
+is the only way the driver reaches the arena now.
+
+The first boot of `console106` answers three things at once: the real mapping ceiling
+(`SWEET GPU: arena window try N MiB -> ...`), whether freedreno's 4 MiB buffer fits a window, and
+therefore whether `bgmtl_create_device()` gets past it.
+
+### 2026-10-28: oosexgang/hakios-metal - assessed, and it is directly usable here
+
+`https://github.com/oosexgang/hakios-metal` (MIT, C++, created 2026-10-28, ~40 KB): "the Metal driver of
+hakios, in C++: Metal's command model on the Adreno through the kernel's GPU driver". Read the README,
+`gpu.hpp`, `gpu.cpp`, `iokit_transport.cpp` and `hakios_metal.h`.
+
+**It speaks our ABI.** Their transport is exactly ours:
+
+```c
+IOServiceGetMatchingService(..., IOServiceMatching("HakiosGPU"));
+IOServiceOpen(...);
+IOConnectCallStructMethod(c, request, data, size, data, &returned);   // selector = msm request number
+IOConnectMapMemory64(c, handle, mach_task_self(), &addr, &size, kIOMapAnywhere);  // BO memory by handle
+```
+
+and the requests they use are the ones we implement: `0x09` GEM_CLOSE, `0x40` GET_PARAM, `0x42` GEM_NEW,
+`0x43` GEM_INFO (GET_IOVA), `0x44` CPU_PREP, `0x45` CPU_FINI, `0x46` SUBMIT, `0x47` WAIT_FENCE, `0x4a`
+SUBMITQUEUE_NEW, `0x4b` SUBMITQUEUE_CLOSE. Their `MsmGemSubmit` (72 bytes), `MsmGemInfo` (24),
+`MsmSubmitCmd` (32), `MsmSubmitBo` (16) match our structs, and their param numbers are msm's (1..4), i.e.
+the numbering `0168` just fixed.
+
+What it adds that we do not have:
+
+- a **tested C++ Metal command model**: `CommandQueue` / `CommandBuffer` with Metal's states, completed
+  handlers in commit order, `waitUntilCompleted`, and blits done by the CP (`CP_MEMCPY`, `CP_MEM_WRITE`),
+  with 9 tests under TSan/ASan;
+- a **fake GPU** that interprets PM4 packets as strictly as the CP (parity, count past the end, unknown
+  opcode, address outside every buffer -> fault). Runs on any machine: free validation of packet streams
+  and of our understanding of them;
+- a **`.metallib` parser** (thin and universal, the AIR64 slice, every offset checked) - we need exactly
+  that to load the system's own metallibs later.
+
+What it does not have is exactly what we already built: shaders. Their README says running a Metal
+function needs AIR -> NIR -> ir3 and that joining hakios's AIR front end is their next step - that is our
+`libbgair.dylib` (Chlorophyll's Mesa 25.0.7 AIR front end), already compiled for iOS 16.
+
+Differences to bridge before it runs on this port (all small):
+
+1. service name `HakiosGPU` -> `SweetAdreno630`;
+2. `MsmParam` is `{ pipe, param, value, len, pad }` (24 bytes) - check it against our `sweet_msm_param`
+   (ours may be `{ param, pad, value, ... }`), because the field order decides whether GET_PARAM reads
+   the right number;
+3. deadlines: they send an **absolute** time (`now + timeout`) like msm, our kernel treats `tv_sec/nsec`
+   as a **relative** duration (that is why the libdrm stand-in converts). Either send a duration in their
+   transport or make the kernel follow msm; the kernel should follow msm.
+
+Verdict: worth taking. It is the cleanest available base for the command side of a Metal device on this
+port, it is testable without a phone, and it complements (`libbgair`) rather than duplicates what we have.
+First cheap use: build their probe for our SDK against the libdrm stand-in, change the service name, and
+run it next to `bgmtl-adddev` - it exercises SUBMIT/fences/blits, the part our kernel already proves.
+
+### 2026-10-28: the probe itself panicked - sizes must not be tried, and big buffers need no alias
+
+`0170`'s first boot died at the very first probe:
+
+```
+panic(cpu 0 caller 0xfffffe0007ad6d68): kmem_alloc(…, 16777216, 0x100021): failed with 3 @vm_kern.c:178
+```
+
+16 MiB. The lesson is not "16 MiB does not fit" but **`kmem_alloc()` in this port panics on failure**
+(`__kmem_failed_panic`), so a probe cannot ask for a size and look at NULL - it kills the boot. Only
+sizes known to work may be requested: 1 MiB, which is what the old arena used and the largest mapping
+that has ever succeeded here.
+
+`0171` therefore fixes the window at 1 MiB and - more importantly - stops treating a kernel alias as
+required:
+
+- a buffer that fits a window gets one (contiguous alias): chardev BOs, command buffers, everything the
+  reloc patcher writes into;
+- a buffer larger than a window gets `kva = NULL`. Nothing needs the alias: the client maps the BO into
+  itself with `IOConnectMapMemory64` and the GPU reaches it by physical address, and the payload blob is
+  built zeroed so there is nothing to clear;
+- relocation patching now refuses a command buffer without an alias instead of dereferencing NULL.
+
+That is what freedreno's 4 MiB buffer needs: memory, not an alias. The real VM fix (pages below
+`gPhysBase` panic in pmap) stays the long-term goal, but the Metal path no longer waits for it.
