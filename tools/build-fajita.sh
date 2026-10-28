@@ -9,13 +9,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/bin:$PATH"
+# BOARD_ENV=tools/enchilada.env builds for the OnePlus 6 (panel height, DTB).
 # shellcheck disable=SC1091
-. tools/fajita.env
+. "${BOARD_ENV:-tools/fajita.env}"
 
 XNU_KERNEL=${XNU_KERNEL:-xnu/out/kernel.development.sweet}
 # fajita2 = SDM845 v2.1, the SoC revision this unit reports (qcom,msm-id
 # 0x141/0x20001). fajita0 is v2 and fajita1 is v1.
-DTB=${DTB:-dtb/boot_unpacked/fajita2.dtb}
+DTB=${DTB:-${DTB_DEFAULT:-dtb/boot_unpacked/fajita2.dtb}}
 ADT=${ADT:-shim/out/fajita.adt}
 PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
 # Single CPU for now: the boot used to stop right after "vm_set_restrictions ok"
@@ -54,7 +55,8 @@ CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=8 sweetsmp=1 keepsyms=1 -noprogress 
 [[ -f "$DTB" ]] || { echo "missing stock DTB: $DTB (unpack the OnePlus boot.img first)" >&2; exit 1; }
 
 mkdir -p shim/out
-python3 tools/mkadt.py "$ADT" --highmem
+# FB_H and RAM_HIGH_SIZE come from the board env file; mkadt's own defaults are the 6T's.
+python3 tools/mkadt.py "$ADT" --highmem ${FB_H:+--fb-h=$FB_H} ${RAM_HIGH_SIZE:+--dram-size=$RAM_HIGH_SIZE}
 # Firmware the drivers want before there is a root travels in the payload, not
 # in git: mkpayload.py --blob announces each file as sweetfwN=<pa>:<size>.
 BLOB_ARGS=()
@@ -110,6 +112,6 @@ python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE" 
 # shim/build.sh cds into shim/, so hand it absolute paths. SHIM_HDR=1 is the
 # stock fajita layout (header v1, gzipped Image.gz-dtb): a v2 header with a dtb
 # section and a raw Image does not boot on this ABL.
-SHIM_HDR=1 DTB=$(realpath "$DTB") shim/build.sh "$(realpath "$PAYLOAD")"
+SHIM_HDR=1 FB_H="${FB_H:-}" DTB=$(realpath "$DTB") shim/build.sh "$(realpath "$PAYLOAD")"
 
 echo "built: shim/out/shim-boot.img"

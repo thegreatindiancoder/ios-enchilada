@@ -13,7 +13,8 @@ DTB=${DTB:-../dtb/boot_unpacked/fajita2.dtb}
 HDR=${SHIM_HDR:-2}
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+# FB_H=2280 selects the OnePlus 6 panel height (console.h defaults to the 6T's 2340).
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra${FB_H:+ -DFB_H=$FB_H}"
 mkdir -p out
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
@@ -56,5 +57,5 @@ else
 		--cmdline "console=null" -o out/shim-boot.img
 fi
 # Host render of the console layout.
-gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
+gcc -O1 -Wall ${FB_H:+-DFB_H=$FB_H} -o out/host_test console.c host_test.c && ./out/host_test
 ls -l out/Image out/shim-boot.img

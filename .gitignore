@@ -8,3 +8,41 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+# phone fact dumps (tools/enchilada-facts.py): getprop, cmdline and DT carry the serial
+facts/
+# boot logs pulled from the phone; panel photos/videos (EXIF can hold location)
+logs/
+*-logs/
+*.log
+log.txt
+/*.jpg
+/*.jpeg
+/*.png
+/*.heic
+/*.mp4
+/*.mov
+# Apple IPSW and extracted Apple firmware
+*.ipsw
+ipsw/
+*.dmg
+*.im4p
+# built or dumped images: boot, root, dtbo, vbmeta, sparse images, payloads
+*.img
+*.simg
+*.bin
+*.dtb
+*.dtbo
+# proprietary Qualcomm/OnePlus firmware (GPU zap/GMU/SQE and friends)
+gpu-fw/
+*.mbn
+*.mdt
+*.b[0-9][0-9]
+*.fw
+# archives
+*.zip
+*.tar
+*.tgz
+*.tar.gz
+# EDL / firehose material
+edl/
+edl_config.json

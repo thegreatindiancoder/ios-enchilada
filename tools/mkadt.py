@@ -332,10 +332,14 @@ def build(seed=None, qemu=False, highmem=False, mem_size=None):
 if __name__ == '__main__':
     # --dram-size=0x... overrides the dram size (A/B tests, e.g. the
     # sweet-proven 0xfcc00000); the panic region is still carved from the top.
+    # --fb-h=2280 is the OnePlus 6 panel (the sweet-fbcon node; everything
+    # else about the framebuffer is the same as on the 6T).
     override = None
     for a in sys.argv:
         if a.startswith('--dram-size='):
             override = int(a.split('=', 1)[1], 0)
+        elif a.startswith('--fb-h='):
+            FB_H = int(a.split('=', 1)[1], 0)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
                  mem_size=override)
     blob = adt.serialize(root)

@@ -1,9 +1,13 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_BASE		0x9d400000UL	/* OnePlus 6T cont_splash_region (36 MiB) */
+#ifndef FB_BASE
+#define FB_BASE		0x9d400000UL	/* OnePlus 6T and 6: cont_splash_region (36 MiB) */
+#endif
 #define FB_W		1080
-#define FB_H		2340
+#ifndef FB_H
+#define FB_H		2340		/* 6T panel; the OnePlus 6 is 2280 (FB_H=2280 shim/build.sh) */
+#endif
 #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
 
 #define RED	0xffff0000U
