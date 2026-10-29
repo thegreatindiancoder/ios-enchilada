@@ -1,0 +1,104 @@
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -14,6 +14,7 @@
+ 
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -122,6 +123,85 @@ SweetPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs)
+ 	    (long long)sweet_rtc_offset);
+ }
+ 
++/*
++ * CPU and L3 clocks. On SDM845 the OSM (Operating State Manager) runs the CPU clusters' and the L3's
++ * frequency and voltage itself; the boot firmware programs its tables, and an OS only reads the
++ * table and writes the index of the state it wants (downstream clk-cpu-osm "v2", mainline
++ * qcom-cpufreq-hw / osm-l3 with the same registers). Hardware limits (LMh) still cap it.
++ *
++ *   base 0x17d41000 L3, 0x17d43000 little cluster (cpu0-3), 0x17d45800 big cluster (cpu4-7)
++ *   +0x000 enable (bit 0), +0x110 + 32*i the table (bits 31:30 source, 18:16 cores, 7:0 L-value:
++ *   source 0 is 300 MHz from GPLL0, otherwise L * 19.2 MHz; the table ends where a row repeats),
++ *   +0x920 the desired state.
++ *
++ * Nothing on this port asked for a state: the clusters run at whatever the boot loader left. This
++ * always logs each domain's state and table (read only); boot-arg sweetcpufreq=1 asks for the
++ * fastest state whose core count is the domain's full one (the rows with fewer cores are boost
++ * states the hardware grants only to partly idle clusters), as Linux's cpufreq-hw does at "max".
++ */
++#define OSM_ENABLE      0x000
++#define OSM_LUT         0x110
++#define OSM_LUT_ROW     32
++#define OSM_LUT_ROWS    40
++#define OSM_PERF_STATE  0x920
++
++static void
++sweet_cpu_clocks(void)
++{
++	static const struct {
++		const char *name;
++		uint64_t pa;
++	} domain[] = {
++		{ "l3", 0x17d41000 }, { "little", 0x17d43000 }, { "big", 0x17d45800 },
++	};
++	uint32_t want = 0;
++
++	(void)PE_parse_boot_argn("sweetcpufreq", &want, sizeof(want));
++	for (unsigned d = 0; d < sizeof(domain) / sizeof(domain[0]); d++) {
++		vm_offset_t map = ml_io_map((vm_offset_t)(domain[d].pa & ~0xfffULL), 0x2000);
++		volatile uint32_t *r;
++		uint32_t mhz[OSM_LUT_ROWS], cores[OSM_LUT_ROWS], rows = 0, full = 0, best = 0;
++		char line[200];
++		size_t used = 0;
++
++		if (map == 0) {
++			IOLog("SWEET CPUFREQ: %s: cannot map the OSM\n", domain[d].name);
++			continue;
++		}
++		r = (volatile uint32_t *)(map + (domain[d].pa & 0xfff));
++		uint32_t enable = r[OSM_ENABLE / 4], state = r[OSM_PERF_STATE / 4];
++		for (uint32_t i = 0; i < OSM_LUT_ROWS; i++) {
++			uint32_t v = r[(OSM_LUT + i * OSM_LUT_ROW) / 4];
++			uint32_t f = (v >> 30) ? (v & 0xff) * 192 / 10 : 300;
++
++			if (f == 0 || (i > 0 && f == mhz[i - 1])) {
++				break;
++			}
++			mhz[i] = f;
++			cores[i] = (v >> 16) & 7;
++			full = cores[i] > full ? cores[i] : full;
++			rows++;
++		}
++		for (uint32_t i = 0; i < rows; i++) {
++			if (cores[i] == full) {
++				best = i;
++			}
++			used += (size_t)snprintf(line + used, sizeof(line) - used, " %u%s", mhz[i], cores[i] == full ? "" : "*");
++			if (used >= sizeof(line) - 8) {
++				break;
++			}
++		}
++		IOLog("SWEET CPUFREQ: %s enable %#x state %u (%u MHz) of %u:%s\n", domain[d].name, enable, state,
++		    state < rows ? mhz[state] : 0, rows, line);
++		if (want == 1 && (enable & 1) && rows > 0 && best != state) {
++			r[OSM_PERF_STATE / 4] = best;
++			__asm__ volatile("dsb sy" ::: "memory");
++			IOLog("SWEET CPUFREQ: %s asked for state %u (%u MHz), reads back %u\n", domain[d].name, best,
++			    mhz[best], r[OSM_PERF_STATE / 4]);
++		}
++	}
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -142,6 +222,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 		    (long long)sweet_rtc_offset, (long long)sweet_rtc_floor);
+ 		publishResource("IORTC", this);
+ 	}
++	sweet_cpu_clocks();
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
