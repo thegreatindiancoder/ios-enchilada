@@ -1,0 +1,26 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -227,13 +227,20 @@ AppleCLCD::start(IOService *provider)
+ 		 * or MetalPluginClassName) to -initWithAcceleratorPort:. Until this
+ 		 * patch the service had no name, so Metal found it and passed it over.
+ 		 */
+-		bool named = accel->setProperty("MetalPluginName", "SweetMetalProbe") &&
++		/*
++		 * sweetmetalplugin=0: publish the service without a plugin name, as hackios does for its
++		 * OpenGL ES window server -- Metal finds no device and CoreAnimation goes on to OpenGL ES
++		 * without first trying to load a bundle that is not there.
++		 */
++		uint32_t plugin = 1;
++		(void)PE_parse_boot_argn("sweetmetalplugin", &plugin, sizeof(plugin));
++		bool named = plugin != 0 && accel->setProperty("MetalPluginName", "SweetMetalProbe") &&
+ 		    accel->setProperty("MetalPluginClassName", "SweetMetalDevice");
+ 		accel->setName("sgx");
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+-			IOLog("SWEET FB: IOAcceleratorES published, MetalPluginName SweetMetalProbe"
+-			    " (properties set: %s)\n", named ? "yes" : "NO");
++			IOLog("SWEET FB: IOAcceleratorES published, MetalPluginName %s\n",
++			    !plugin ? "none (sweetmetalplugin=0)" : named ? "SweetMetalProbe" : "NOT SET");
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);
