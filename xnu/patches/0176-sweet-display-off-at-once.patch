@@ -1,0 +1,23 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -261,7 +261,20 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
++		static int fade = -1;
+ 		uint32_t step = fb->fFadeStep;
++		/*
++		 * Each step reads and writes the whole panel through an uncached mapping, which on
++		 * a 1080x2280 panel is slow enough to be seen as six separate dimmings. Unless
++		 * sweetfb_fade=1 asks for the fade, go straight to the black frame.
++		 */
++		if (fade < 0) {
++			fade = 0;
++			(void)PE_parse_boot_argn("sweetfb_fade", &fade, sizeof(fade));
++		}
++		if (!fade && step < 6) {
++			step = 6;
++		}
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+ 		}
