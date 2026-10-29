@@ -1,0 +1,432 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -25,8 +25,12 @@
+ #include <sys/ioccom.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <sys/sysctl.h>
++#include <kern/locks.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* osfmk/arm/pmap/pmap.h and arm/caches_internal.h: the static physical aperture and its cache clean */
++extern uint64_t phystokv_range(uint64_t pa, vm_size_t *max_len);
++extern void flush_dcache64(uint64_t addr, unsigned count, int phys);
+ /* iokit/Kernel/arm/SweetAdreno.cpp: the service a client opens */
+ extern void SweetAdrenoPublish(void);
+ void sweet_gpu_probe(void);
+@@ -478,6 +482,22 @@ static uint64_t gpu_arena_pa;
+ static uint32_t gpu_arena_size;
+ static uint32_t gpu_arena_used;
+ 
++/*
++ * Client pages that came back (sweet_gpu_free_pages), reused before gpu_arena_used moves on.
++ * Without them every GEM_CLOSE leaked its pages, and CoreAnimation, which makes and drops
++ * textures all the time, would run the arena dry. Adjacent holes are always merged.
++ */
++#define GPU_ARENA_HOLES        256u
++struct gpu_arena_hole {
++	uint32_t off;
++	uint32_t size;          /* 0: unused entry */
++};
++static struct gpu_arena_hole gpu_arena_holes[GPU_ARENA_HOLES];
++static uint32_t gpu_arena_high;            /* highest gpu_arena_used ever: pages above are still zero */
++static uint32_t gpu_arena_top_logged;      /* highest MiB of gpu_arena_used reported so far */
++static LCK_GRP_DECLARE(gpu_arena_grp, "sweet_gpu_arena");
++static LCK_MTX_DECLARE(gpu_arena_lock, &gpu_arena_grp);
++
+ /* GPU address space (stage 8f): all of L1[2], first fit, a guard page between buffers. */
+ #define GPU_VA_BYTES       0x40000000ull        /* 1 GiB */
+ #define GPU_VA_EXTENTS     32u
+@@ -530,6 +550,9 @@ gpu_bo_init(vm_offset_t blob)
+ 	gpu_pt_blob = blob;
+ 	gpu_va_next = GPU_VA_BASE;
+ 	gpu_arena_used = 0;
++	bzero(gpu_arena_holes, sizeof(gpu_arena_holes));
++	gpu_arena_high = 0;
++	gpu_arena_top_logged = 0;
+ 	for (unsigned i = 0; i < GPU_BO_MAX; i++) {
+ 		gpu_bos[i].used = false;
+ 	}
+@@ -1188,16 +1211,47 @@ gpu_ring_flush(vm_offset_t core, unsigned wptr)
+ 	gpu_cp_wr(core, A6XX_CP_RB_WPTR, wptr);
+ }
+ 
++/*
++ * Lines printed per client call. The 6T tests made a handful of calls; CoreAnimation makes
++ * thousands a second, and a console line for each floods the log ring and costs every frame.
++ * Each kind is printed the first GPU_LOG_FIRST times; boot-arg sweetgpulog=1 prints them all.
++ */
++#define GPU_LOG_FIRST          16u
++static bool
++gpu_log(uint32_t *seen)
++{
++	static int all = -1;
++
++	if (all < 0) {
++		uint32_t v = 0;
++		(void)PE_parse_boot_argn("sweetgpulog", &v, sizeof(v));
++		all = v != 0;
++	}
++	return all || (*seen)++ < GPU_LOG_FIRST;
++}
++
+ static bool
+ gpu_ring_wait_idle(vm_offset_t core, const char *what)
+ {
++	static uint32_t logged;
++
++	/*
++	 * Every client submission waits here, so poll finely at first (20 us steps for 20 ms) and
++	 * only then fall back to 1 ms steps; the overall patience stays about 100 s.
++	 */
+ 	for (unsigned i = 0; i < 100000; i++) {
+ 		if (gpu_cp_rd(core, A6XX_CP_RB_RPTR) == gpu_cp_wptr) {
+-			printf("SWEET GPU: cp %s: ring idle (RPTR=WPTR=%u) rbbm_status %#x\n",
+-			    what, gpu_cp_wptr, gpu_cp_rd(core, A6XX_RBBM_STATUS));
++			if (gpu_log(&logged)) {
++				printf("SWEET GPU: cp %s: ring idle (RPTR=WPTR=%u) rbbm_status %#x\n",
++				    what, gpu_cp_wptr, gpu_cp_rd(core, A6XX_RBBM_STATUS));
++			}
+ 			return true;
+ 		}
+-		gpu_wait_ms(1);
++		if (i < 1000) {
++			delay(20);
++		} else {
++			gpu_wait_ms(1);
++		}
+ 	}
+ 	printf("SWEET GPU: cp %s: ring did NOT drain: rptr %u wptr %u rbbm_status %#x "
+ 	    "cp_status1 %#x hw_fault %#x irq %#x protect %#x rbbm_irq %#x\n",
+@@ -1838,59 +1892,170 @@ sweet_gpu_report(const char *why)
+  * gPhysBase on its free lists and pmap panics on them (phys_to_kv_range, console80 and the
+  * 2026-10-26 panel photo). The arena is contiguous, above the base, and the CP already
+  * writes through it. gpu_arena_used is shared with gpu_bo_alloc() so the two never overlap;
+- * like the chardev BOs these pages are never returned (bump allocator).
++ * client pages come back through sweet_gpu_free_pages() and are reused (chardev BOs are not).
+  */
++/* The window alias of [off, off + sz), or 0 when the range is not inside one mapped window. */
++static vm_offset_t
++gpu_arena_alias(uint32_t off, uint64_t sz)
++{
++	if (gpu_arena_window_bytes == 0 || (uint64_t)off + sz > gpu_arena_mapped_bytes ||
++	    (off % gpu_arena_window_bytes) + sz > gpu_arena_window_bytes) {
++		return 0;
++	}
++	return gpu_arena_kva(off);
++}
++
++/*
++ * Zero pages that held an earlier buffer. Inside the window: through its uncached alias, as
++ * before. Past it there is no alias of our own, but the arena lies in the static physical
++ * aperture - submit already cleans every buffer through it by physical address - so zero it
++ * there with plain stores (not bzero: dc zva) and clean the lines out to memory before the GPU
++ * or the client sees the pages.
++ */
++static void
++gpu_arena_zero(uint32_t off, uint64_t sz)
++{
++	vm_offset_t alias = gpu_arena_alias(off, sz);
++
++	if (alias != 0) {
++		for (uint64_t i = 0; i < sz; i += 4) {
++			*(volatile uint32_t *)(alias + (uint32_t)i) = 0;
++		}
++		return;
++	}
++	uint64_t pa = gpu_arena_pa + off, left = sz;
++	while (left > 0) {
++		vm_size_t n = (vm_size_t)left;
++		volatile uint64_t *p = (volatile uint64_t *)phystokv_range(pa, &n);
++		for (vm_size_t i = 0; i < n / 8; i++) {
++			p[i] = 0;
++		}
++		pa += n;
++		left -= n;
++	}
++	flush_dcache64(gpu_arena_pa + off, (unsigned)sz, 1);
++}
++
++/* Best fit among the holes (arena lock held). */
++static bool
++gpu_arena_take_hole(uint32_t sz, uint32_t *off)
++{
++	int best = -1;
++
++	for (unsigned i = 0; i < GPU_ARENA_HOLES; i++) {
++		if (gpu_arena_holes[i].size >= sz &&
++		    (best < 0 || gpu_arena_holes[i].size < gpu_arena_holes[best].size)) {
++			best = (int)i;
++		}
++	}
++	if (best < 0) {
++		return false;
++	}
++	*off = gpu_arena_holes[best].off;
++	gpu_arena_holes[best].off += sz;
++	gpu_arena_holes[best].size -= sz;
++	return true;
++}
++
++/* Return [off, off + sz) (arena lock held): merge with its neighbours, or lower the top. */
++static void
++gpu_arena_give(uint32_t off, uint32_t sz)
++{
++	for (unsigned i = 0; i < GPU_ARENA_HOLES; i++) {
++		struct gpu_arena_hole *h = &gpu_arena_holes[i];
++
++		if (h->size == 0) {
++			continue;
++		}
++		if (h->off + h->size == off) {
++			off = h->off;
++			sz += h->size;
++			h->size = 0;
++		} else if (off + sz == h->off) {
++			sz += h->size;
++			h->size = 0;
++		}
++	}
++	if (off + sz == gpu_arena_used) {
++		gpu_arena_used = off;
++		return;
++	}
++	for (unsigned i = 0; i < GPU_ARENA_HOLES; i++) {
++		if (gpu_arena_holes[i].size == 0) {
++			gpu_arena_holes[i].off = off;
++			gpu_arena_holes[i].size = sz;
++			return;
++		}
++	}
++	printf("SWEET GPU: arena: hole table full, %u bytes at arena+%#x left unused\n", sz, off);
++}
++
+ bool
+ sweet_gpu_alloc_pages(uint64_t size, uint64_t *pa, void **kva)
+ {
++	static uint32_t logged;
+ 	uint64_t sz = (size + 0xfffull) & ~0xfffull;
+ 	uint32_t off;
++	bool reused, dirty;
+ 
+ 	if (!gpu_live || gpu_arena_window_bytes == 0 || sz == 0 || sz > gpu_arena_size) {
+ 		return false;
+ 	}
+-	if ((uint64_t)gpu_arena_used + sz > gpu_arena_size) {
+-		printf("SWEET GPU: arena: %llu bytes do not fit (%u of %u used)\n",
+-		    (unsigned long long)sz, gpu_arena_used, gpu_arena_size);
+-		return false;
+-	}
+-	off = gpu_arena_used;
+-	vm_offset_t alias = 0;
+-	if ((uint64_t)off + sz <= gpu_arena_mapped_bytes) {
+-		/* Inside the mapped window: keep the buffer there so its kernel alias is contiguous. */
+-		if ((off % gpu_arena_window_bytes) + sz > gpu_arena_window_bytes) {
+-			off = ((off + gpu_arena_window_bytes - 1) / gpu_arena_window_bytes) *
+-			    gpu_arena_window_bytes;
++	lck_mtx_lock(&gpu_arena_lock);
++	reused = gpu_arena_take_hole((uint32_t)sz, &off);
++	dirty = reused;
++	if (!reused) {
++		off = gpu_arena_used;
++		if ((uint64_t)off + sz > gpu_arena_size) {
++			uint64_t holes = 0;
++			for (unsigned i = 0; i < GPU_ARENA_HOLES; i++) {
++				holes += gpu_arena_holes[i].size;
++			}
++			lck_mtx_unlock(&gpu_arena_lock);
++			printf("SWEET GPU: arena: %llu bytes do not fit (%u of %u used, %llu in holes)\n",
++			    (unsigned long long)sz, off, gpu_arena_size, (unsigned long long)holes);
++			return false;
++		}
++		dirty = off < gpu_arena_high;     /* the top came down over freed buffers */
++		gpu_arena_used = off + (uint32_t)sz;
++		if (gpu_arena_used > gpu_arena_high) {
++			gpu_arena_high = gpu_arena_used;
+ 		}
+-		alias = gpu_arena_kva(off);
+ 	}
+-	if ((uint64_t)off + sz > gpu_arena_size) {
+-		printf("SWEET GPU: arena: %llu bytes do not fit (%u used of %u)\n",
+-		    (unsigned long long)sz, off, gpu_arena_size);
+-		return false;
++	vm_offset_t alias = gpu_arena_alias(off, sz);
++	if (dirty || alias != 0) {
++		/* Never-used pages past the window need nothing: the payload blob is built zeroed. */
++		gpu_arena_zero(off, sz);
+ 	}
+-	gpu_arena_used = off + (uint32_t)sz;
+-	if (alias != 0) {
+-		for (uint64_t i = 0; i < sz; i += 4) {
+-			*(volatile uint32_t *)(alias + (uint32_t)i) = 0;
+-		}
+-	} else {
+-		/* No alias for this one: the payload blob is built zeroed and the client writes it. */
+-		printf("SWEET GPU: arena: %llu bytes at arena+%#x without a kernel alias\n",
+-		    (unsigned long long)sz, off);
++	uint32_t top = gpu_arena_used >> 20;
++	bool grew = top > gpu_arena_top_logged;
++	if (grew) {
++		gpu_arena_top_logged = top;
+ 	}
++	lck_mtx_unlock(&gpu_arena_lock);
++
+ 	*pa = gpu_arena_pa + off;
+ 	*kva = (void *)alias;
+-	printf("SWEET GPU: arena: %llu bytes at arena+%#x pa %#llx\n",
+-	    (unsigned long long)sz, off, (unsigned long long)*pa);
++	if (gpu_log(&logged) || grew) {
++		printf("SWEET GPU: arena: %llu bytes at arena+%#x pa %#llx%s%s, top %u KiB\n",
++		    (unsigned long long)sz, off, (unsigned long long)*pa, reused ? ", reused" : "",
++		    alias != 0 ? "" : ", no kernel alias", gpu_arena_used / 1024);
++	}
+ 	return true;
+ }
+ 
+ void
+ sweet_gpu_free_pages(uint64_t pa, uint64_t size)
+ {
+-	(void)pa;
+-	(void)size;
++	uint64_t sz = (size + 0xfffull) & ~0xfffull;
++
++	if (gpu_arena_size == 0 || sz == 0 || pa < gpu_arena_pa || (pa & 0xfff) != 0 ||
++	    pa - gpu_arena_pa + sz > gpu_arena_size) {
++		return;
++	}
++	lck_mtx_lock(&gpu_arena_lock);
++	gpu_arena_give((uint32_t)(pa - gpu_arena_pa), (uint32_t)sz);
++	lck_mtx_unlock(&gpu_arena_lock);
+ }
+ 
+ /* ---- stage 8e: the ABI the device node exposes ------------------------- */
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -73,6 +73,26 @@ void SweetAdrenoPublish(void);
+ static IOLock *gAdrenoLock;
+ static uint32_t gAdrenoClients;
+ 
++/*
++ * Lines printed per call. The 6T tests made a handful of calls; CoreAnimation makes thousands
++ * a second, and a console line for each floods the log ring and costs every frame. Each kind is
++ * printed the first ADRENO_LOG_FIRST times; boot-arg sweetgpulog=1 prints them all, as before.
++ */
++#define ADRENO_LOG_FIRST        16u
++static int gAdrenoLogAll = -1;
++static uint32_t gLogSelector, gLogIb, gLogSubmit, gLogWait, gLogWaitDump;
++
++static bool
++adrenoLog(uint32_t *seen)
++{
++	if (gAdrenoLogAll < 0) {
++		uint32_t all = 0;
++		(void)PE_parse_boot_argn("sweetgpulog", &all, sizeof(all));
++		gAdrenoLogAll = all != 0;
++	}
++	return gAdrenoLogAll || (*seen)++ < ADRENO_LOG_FIRST;
++}
++
+ struct sweet_gem {
+ 	IOMemoryDescriptor       *md;           /* NULL: free slot */
+ 	IOBufferMemoryDescriptor *buf;          /* == md for BOs made by GEM_NEW, else NULL */
+@@ -318,9 +338,18 @@ SweetAdrenoUserClient::releaseGem(struct sweet_gem *g)
+ 		if (g->surface != NULL) {
+ 			g->surface->retain();
+ 		}
+-	} else if (g->iova != IOVA_UNSET) {
+-		sweet_gpu_vm_unmap(g->iova, g->size);
+-		sweet_gpu_iova_free(g->iova, g->vaLen);
++	} else {
++		if (g->iova != IOVA_UNSET) {
++			sweet_gpu_vm_unmap(g->iova, g->size);
++			sweet_gpu_iova_free(g->iova, g->vaLen);
++		}
++		/*
++		 * Arena pages go back for reuse (surface BOs have no pa). The client unmaps a BO
++		 * before it closes it (Mesa: munmap, then GEM_CLOSE), so nothing still reaches them.
++		 */
++		if (g->pa != 0) {
++			sweet_gpu_free_pages(g->pa, g->size);
++		}
+ 	}
+ 	OSSafeReleaseNULL(g->md);
+ 	g->buf = NULL;
+@@ -442,6 +471,7 @@ SweetAdrenoUserClient::gemNew(struct sweet_msm_gem_new *r)
+ 	IOLockUnlock(gAdrenoLock);
+ 	if (ret != kIOReturnSuccess) {
+ 		buf->release();
++		sweet_gpu_free_pages(pa, size);
+ 	}
+ 	return ret;
+ }
+@@ -654,12 +684,20 @@ SweetAdrenoUserClient::submit(struct sweet_msm_gem_submit *r)
+ 			flush_dcache64((addr64_t)g->pa, (unsigned)g->size, TRUE);
+ 		}
+ 	}
+-	/* What the CP is about to read, through the uncached alias. */
+-	{
++	/*
++	 * What the CP is about to read, through the uncached alias - which only buffers inside the
++	 * first arena window have. Mesa's command buffers soon lie past it (kva NULL), and reading
++	 * one here was the 2026-10-29 backboardd panic (kernel data abort at address 0).
++	 */
++	if (adrenoLog(&gLogIb)) {
+ 		struct sweet_gem *cb = objs[cmds[0].submit_idx];
+-		volatile uint32_t *q = (volatile uint32_t *)(void *)cb->kva;
+-		IOLog("SWEET ADRENO: ib %#llx: %#x %#x %#x %#x %#x %#x %#x %#x\n", cb->iova,
+-		    q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
++		if (cb->kva != NULL) {
++			volatile uint32_t *q = (volatile uint32_t *)(void *)cb->kva;
++			IOLog("SWEET ADRENO: ib %#llx: %#x %#x %#x %#x %#x %#x %#x %#x\n", cb->iova,
++			    q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
++		} else {
++			IOLog("SWEET ADRENO: ib %#llx (no kernel alias)\n", cb->iova);
++		}
+ 	}
+ 	{
+ 		uint32_t fence = sweet_gpu_submit(ib, ibn, r->nr_cmds);
+@@ -678,8 +716,10 @@ SweetAdrenoUserClient::submit(struct sweet_msm_gem_submit *r)
+ 		r->fence = fence;
+ 		r->fence_fd = -1;
+ 		ret = kIOReturnSuccess;
+-		IOLog("SWEET ADRENO: submit %u bos %u cmds, ib %#llx %u dwords, fence %u\n",
+-		    r->nr_bos, r->nr_cmds, ib[0], ibn[0], fence);
++		if (adrenoLog(&gLogSubmit)) {
++			IOLog("SWEET ADRENO: submit %u bos %u cmds, ib %#llx %u dwords, fence %u\n",
++			    r->nr_bos, r->nr_cmds, ib[0], ibn[0], fence);
++		}
+ 	}
+ unlock:
+ 	IOLockUnlock(gAdrenoLock);
+@@ -713,15 +753,18 @@ SweetAdrenoUserClient::waitFenceCall(struct sweet_msm_wait_fence *r)
+ 		uint64_t ns = (r->timeout.tv_sec < 0 || r->timeout.tv_nsec < 0) ? 0 :
+ 		    (uint64_t)r->timeout.tv_sec * NSEC_PER_SEC + (uint64_t)r->timeout.tv_nsec;
+ 		ret = waitFence(r->fence, ns) ? kIOReturnSuccess : (sweet_gpu_ready() ? kIOReturnTimeout : kIOReturnNotReady);
+-		IOLog("SWEET ADRENO: wait fence %u (%llu ns) -> %#x, last %u\n", r->fence,
+-		    (unsigned long long)ns, ret, sweet_gpu_fence_last());
++		if (ret != kIOReturnSuccess || adrenoLog(&gLogWait)) {
++			IOLog("SWEET ADRENO: wait fence %u (%llu ns) -> %#x, last %u\n", r->fence,
++			    (unsigned long long)ns, ret, sweet_gpu_fence_last());
++		}
+ 		/*
+ 		 * The client's own output does not reach the console (launchd gives it a stdout nobody
+ 		 * reads), so the kernel reports what the GPU produced - on timeout too, which is exactly
+ 		 * when the contents matter. The tester writes 0x600d0001/0x600d0002 at +0x10/+0x20 of the
+ 		 * target, so seeing them means the command buffer ran and the fence is honest.
+ 		 */
+-		for (uint32_t i = 0; i < GEM_MAX; i++) {
++		bool dump = gAdrenoLogAll > 0 || (ret != kIOReturnSuccess && adrenoLog(&gLogWaitDump));
++		for (uint32_t i = 0; dump && i < GEM_MAX; i++) {
+ 			struct sweet_gem *g = &fGems[i];
+ 			if (g->md == NULL || g->pa == 0 || g->kva == NULL) {
+ 				continue;
+@@ -893,7 +936,9 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 
+ #define NEED(T) do { if (in < sizeof(T)) { return kIOReturnBadArgument; } } while (0)
+ 	/* Which selector the client asked for, before anything can panic on it. */
+-	IOLog("SWEET ADRENO: selector %#x in %u bytes\n", selector, (unsigned)in);
++	if (adrenoLog(&gLogSelector)) {
++		IOLog("SWEET ADRENO: selector %#x in %u bytes\n", selector, (unsigned)in);
++	}
+ 
+ 	switch (selector) {
+ 	case SWEET_GPU_SEL_GET_PARAM:
