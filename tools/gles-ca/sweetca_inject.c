@@ -18,7 +18,9 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <mach/mach.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -35,6 +37,7 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 
 #define CACHE_BASE      0x180000000UL
 #define SWEETCA_GL      "/usr/local/lib/libsweetca.gl.dylib"
+#define PAYLOAD_DIR     "/tmp/sweetca"   /* shorter than /usr/local/lib: install names are rewritten in place */
 #define GPU_SERVICE     "SweetAdreno630"
 
 /* iOS 16.7.16 (20H392), iPhone10,3: unslid; slot = vtable + 0x10 + offset */
@@ -261,17 +264,86 @@ watch_for_faults(void)
 	sigaction(SIGTRAP, &action, NULL);
 }
 
+/*
+ * The boot image may carry newer copies of the OpenGL ES libraries (tools/gles-ca/mkuserland.py,
+ * xnu 0175 kern.sweetuserland): written into PAYLOAD_DIR, built with install names there, and
+ * preferred to the root image's. One root image, then every library change is a boot image only.
+ * Returns the path of libsweetca.gl.dylib to load, or NULL when the payload has none.
+ */
+static const char *
+unpack_payload(void)
+{
+	static char gl_path[128];
+	size_t length = 0;
+	uint8_t *archive;
+	uint32_t count, header;
+	unsigned written = 0;
+
+	if (sysctlbyname("kern.sweetuserland", NULL, &length, NULL, 0) != 0 || length < 16) {
+		return NULL;
+	}
+	if ((archive = malloc(length)) == NULL) {
+		return NULL;
+	}
+	if (sysctlbyname("kern.sweetuserland", archive, &length, NULL, 0) != 0 ||
+	    memcmp(archive, "SWUL", 4) != 0 || *(uint32_t *)(archive + 4) != 1) {
+		say("sweetca: the payload's userland archive is unreadable\n");
+		free(archive);
+		return NULL;
+	}
+	count = *(uint32_t *)(archive + 8);
+	header = *(uint32_t *)(archive + 12);
+	if (header != 16 + 64 * count || header > length) {
+		say("sweetca: the payload's userland archive has a bad header\n");
+		free(archive);
+		return NULL;
+	}
+	(void)mkdir(PAYLOAD_DIR, 0755);
+	gl_path[0] = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const uint8_t *entry = archive + 16 + 64 * i;
+		char name[57], path[128], temp[136];
+		uint32_t offset = *(const uint32_t *)(entry + 56), size = *(const uint32_t *)(entry + 60);
+		int fd;
+
+		memcpy(name, entry, 56);
+		name[56] = 0;
+		if (name[0] == 0 || strchr(name, '/') != NULL || offset > length || size > length - offset) {
+			say("sweetca: payload entry %u is malformed; the payload is ignored\n", i);
+			free(archive);
+			return NULL;
+		}
+		snprintf(path, sizeof(path), "%s/%s", PAYLOAD_DIR, name);
+		snprintf(temp, sizeof(temp), "%s.new", path);
+		if ((fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC, 0755)) < 0 ||
+		    write(fd, archive + offset, size) != (ssize_t)size || close(fd) != 0 || rename(temp, path) != 0) {
+			say("sweetca: %s cannot be written; the payload is ignored\n", path);
+			free(archive);
+			return NULL;
+		}
+		written++;
+		if (strcmp(name, "libsweetca.gl.dylib") == 0) {
+			strlcpy(gl_path, path, sizeof(gl_path));
+		}
+	}
+	free(archive);
+	say("sweetca: %u file(s) from the boot payload into %s\n", written, PAYLOAD_DIR);
+	return gl_path[0] ? gl_path : NULL;
+}
+
 static int
 load_gl(void)
 {
 	io_service_t gpu;
-	void *library;
+	void *library = NULL;
+	const char *payload_gl;
 
 	if (boot_arg("gl=0")) {
 		say("sweetca: gl=0: CoreAnimation keeps its software renderer\n");
 		return 0;
 	}
-	if (access(SWEETCA_GL, R_OK) != 0) {
+	payload_gl = unpack_payload();
+	if (payload_gl == NULL && access(SWEETCA_GL, R_OK) != 0) {
 		say("sweetca: %s is not installed\n", SWEETCA_GL);
 		return 0;
 	}
@@ -283,14 +355,22 @@ load_gl(void)
 	if (gpu != 0) {
 		IOObjectRelease(gpu);
 	}
-	if ((library = dlopen(SWEETCA_GL, RTLD_NOW)) == NULL) {
+	if (payload_gl != NULL && (library = dlopen(payload_gl, RTLD_NOW)) == NULL) {
+		say("sweetca: %s; trying the root image's copy\n", dlerror());
+	}
+	if (library == NULL && (library = dlopen(SWEETCA_GL, RTLD_NOW)) == NULL) {
 		say("sweetca: %s\n", dlerror());
 		return 0;
 	}
 	gl_function_values = (void (*)(void *, unsigned, unsigned, size_t, size_t, const float *))dlsym(library,
 	    "hakios_gl_function_values");
 	gl_function_refused = (void (*)(unsigned))dlsym(library, "hakios_gl_function_refused");
-	say("sweetca: OpenGL ES library loaded (%s)\n", SWEETCA_GL);
+	{
+		Dl_info info;
+
+		say("sweetca: OpenGL ES library loaded (%s)\n",
+		    dladdr(dlsym(library, "hakios_gl_create"), &info) && info.dli_fname ? info.dli_fname : "?");
+	}
 	return 1;
 }
 

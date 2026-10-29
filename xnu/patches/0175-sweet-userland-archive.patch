@@ -1,0 +1,45 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -24,6 +24,7 @@
+ #include <sys/uio_internal.h>   /* struct uio lives here, not in sys/uio.h */
+ #include <sys/ioccom.h>
+ #include <miscfs/devfs/devfs.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* iokit/Kernel/arm/SweetAdreno.cpp: the service a client opens */
+@@ -3611,4 +3612,34 @@ gmu_only:
+ 	gpu_wait_ms(10);
+ 	printf("SWEET GPU: gmu sysreset at the end %#x\n", gpu_rd_quiet(gmu, GPU_GMU_SYSRESET));
+ }
++
++/*
++ * kern.sweetuserland: the bytes of the boot payload's userland archive (tools/mkpayload.py
++ * --named-blob sweetuserland=FILE, announced as sweetuserland=<pa>:<size>). Files that change
++ * often -- the GPU userland libraries -- travel in the boot image this way instead of the root
++ * image, and a reader in userspace (tools/gles-ca/sweetca_inject.c) unpacks them.
++ *
++ * The blob lies right after the kernel, inside the static region the kernel's own mapping covers,
++ * so it is read through that mapping (ml_static_ptovirt): no ml_io_map(), whose kmem_alloc() cannot
++ * place more than about 1 MiB in this port's kernel_map (patches 0170-0172). Read only; without the
++ * boot-arg the node answers ENOENT.
++ */
++static int
++sweet_userland_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char arg[64];
++	uint64_t pa = 0, size = 0;
++
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (!PE_parse_boot_argn("sweetuserland", arg, sizeof(arg)) || !gpu_parse_range(arg, &pa, &size) ||
++	    size == 0 || size > (256ULL << 20)) {
++		return ENOENT;
++	}
++	return SYSCTL_OUT(req, (const void *)ml_static_ptovirt((vm_offset_t)pa), (size_t)size);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweetuserland, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sweet_userland_sysctl, "S", "userland archive of the boot payload");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

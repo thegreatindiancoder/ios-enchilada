@@ -140,7 +140,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blob_paths=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blob_paths=None, named_blobs=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -178,6 +178,16 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blob_paths=None):
         kernel_end = va + size
         pieces.append((va, size, data))
         blobs.append((va - virt_base + PHYS_BASE, len(data)))
+    # Named blobs: announced as NAME=<pa>:<size>, independent of how many sweetfwN there are.
+    named = []
+    for spec in (named_blobs or []):
+        name, path = spec.split('=', 1)
+        data = open(path, 'rb').read()
+        size = (len(data) + PAGE - 1) & ~(PAGE - 1)
+        va = kernel_end
+        kernel_end = va + size
+        pieces.append((va, size, data))
+        named.append((name, va - virt_base + PHYS_BASE, len(data)))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -195,13 +205,18 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None, blob_paths=None):
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
                      PHYS_BASE, MEM_SIZE)
     extra = ''.join(' sweetfw%d=%#x:%#x' % (i, pa, n) for i, (pa, n) in enumerate(blobs))
-    cl = (cmdline + extra).encode()[:BOOT_LINE_LENGTH - 1]
+    extra += ''.join(' %s=%#x:%#x' % (name, pa, n) for name, pa, n in named)
+    cl = (cmdline + extra).encode()
+    if len(cl) > BOOT_LINE_LENGTH - 1:
+        # Cutting it would drop the sweetfwN blobs at its end without a word: refuse instead.
+        sys.exit('mkpayload: the command line is %d bytes, xnu takes %d: shorten it'
+                 % (len(cl), BOOT_LINE_LENGTH - 1))
     out[CMDLINE:CMDLINE + len(cl)] = cl
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
                 entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
-                blobs=[(hex(pa), hex(n)) for pa, n in blobs],
+                blobs=[(hex(pa), hex(n)) for pa, n in blobs] + [(name, hex(pa), hex(n)) for name, pa, n in named],
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -213,8 +228,10 @@ if __name__ == '__main__':
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     ap.add_argument('--blob', action='append', default=[],
                     help='extra file for the kernel, announced as sweetfwN=<pa>:<size> (repeatable)')
+    ap.add_argument('--named-blob', action='append', default=[], metavar='NAME=FILE',
+                    help='extra file announced as NAME=<pa>:<size> (repeatable), e.g. sweetuserland=archive')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.blob)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.blob, a.named_blob)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

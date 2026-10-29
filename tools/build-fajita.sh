@@ -119,6 +119,13 @@ if [[ ! -f "$PTE_BLOB" || $(stat -c%s "$PTE_BLOB" 2>/dev/null || echo 0) -ne 262
 	dd if=/dev/zero of="$PTE_BLOB" bs=1024 count=256 status=none
 fi
 BLOB_ARGS+=(--blob "$PTE_BLOB")
+# USERLAND_ARCHIVE: files for userspace that travel in the boot image instead of the root image
+# (tools/gles-ca/mkuserland.py, xnu 0175 kern.sweetuserland), announced as sweetuserland=<pa>:<size>.
+if [[ -n "${USERLAND_ARCHIVE:-}" ]]; then
+	[[ -f "$USERLAND_ARCHIVE" ]] || { echo "missing USERLAND_ARCHIVE: $USERLAND_ARCHIVE" >&2; exit 1; }
+	BLOB_ARGS+=(--named-blob "sweetuserland=$USERLAND_ARCHIVE")
+	echo "userland archive: $(stat -c%s "$USERLAND_ARCHIVE") bytes"
+fi
 python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE" "${BLOB_ARGS[@]}"
 # shim/build.sh cds into shim/, so hand it absolute paths. SHIM_HDR=1 is the
 # stock fajita layout (header v1, gzipped Image.gz-dtb): a v2 header with a dtb

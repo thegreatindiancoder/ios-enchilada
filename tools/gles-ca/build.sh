@@ -50,6 +50,21 @@ python3 -I "$HERE/../macho-add-dylib.py" "$STOCK" "$OUT/usr/libexec/backboardd" 
 chmod 0755 "$OUT/usr/libexec/backboardd" "$OUT"/usr/local/lib/*.dylib
 python3 -I "$HERE/../macho-add-dylib.py" --check "$OUT"/usr/local/lib/*.dylib "$OUT/usr/libexec/backboardd"
 
+# The same OpenGL ES libraries for the boot payload (USERLAND_ARCHIVE of build-fajita.sh): install
+# names in /tmp/sweetca, where sweetca_inject.c unpacks kern.sweetuserland.
+PD=/tmp/sweetca
+P="$OUT/payload"
+mkdir -p "$P"
+for f in libdrm.2.dylib libOSMesa.8.dylib libsweetca.gl.dylib; do cp -f "$OUT/usr/local/lib/$f" "$P/"; done
+llvm-install-name-tool -id $PD/libdrm.2.dylib "$P/libdrm.2.dylib"
+llvm-install-name-tool -id $PD/libOSMesa.8.dylib -change $LIB/libdrm.2.dylib $PD/libdrm.2.dylib "$P/libOSMesa.8.dylib"
+llvm-install-name-tool -id $PD/libsweetca.gl.dylib -change $LIB/libOSMesa.8.dylib $PD/libOSMesa.8.dylib \
+	"$P/libsweetca.gl.dylib"
+python3 -I "$HERE/../macho-add-dylib.py" --rehash "$P"/*.dylib >/dev/null
+python3 -I "$HERE/../macho-add-dylib.py" --check "$P"/*.dylib
+python3 -I "$HERE/mkuserland.py" "$OUT/userland.swul" "$P/libdrm.2.dylib" "$P/libOSMesa.8.dylib" "$P/libsweetca.gl.dylib"
+for f in "$P"/*.dylib; do llvm-objdump --macho --dylibs-used "$f" | grep -E "/tmp/sweetca|/usr/local" ; done
+
 for f in "$OUT"/usr/local/lib/*.dylib "$OUT/usr/libexec/backboardd"; do
 	printf '%-60s %9d\n' "${f#$OUT}" "$(stat -c %s "$f")"
 	llvm-objdump --macho --dylibs-used "$f" | tail -n +2 | grep -E '@rpath|/usr/local' || true
