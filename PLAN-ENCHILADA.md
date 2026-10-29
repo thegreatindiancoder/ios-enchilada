@@ -140,6 +140,24 @@ the UI is complete.
 
 ## 3. Hardware acceleration (GPU-composited UI, then Metal, on Adreno 630)
 
+### 3.0 Quick wins without the GPU (2026-10-29, to be measured on the phone)
+
+Two things slow the CPU-rendered UI that have nothing to do with the GPU:
+
+- **The panel is updated 10 times a second** (`sweetfb_hz=10`). The 6T chose 10 Hz when only the
+  four A55 cores ran; the panel memory is mapped write-combined, so copying a 10 MB frame is cheap
+  next to CoreAnimation's own software rendering. With eight cores, 30 Hz is the next value to try.
+- **No OS on this port ever set the CPU clocks.** On SDM845 the OSM runs the clusters' and the
+  L3's frequency from tables the boot firmware programs; an OS writes only the desired state
+  (downstream `qcom,clk-cpu-osm-v2`, mainline `qcom-cpufreq-hw`/`osm-l3`). Patch 0177 logs each
+  domain's state and table at every boot (`SWEET CPUFREQ: ...`), and `sweetcpufreq=1` asks for the
+  fastest non-boost state; the hardware limits (LMh) still cap it.
+
+The test image `shim-boot-op6-cpu-gui-fast.img` carries both (`sweetcpufreq=1 sweetfb_hz=30`).
+*Accept:* the `SWEET CPUFREQ` lines show the requested state read back, Settings scrolls visibly
+smoother than with `cpu-gui`, and the phone neither resets nor overheats in ten minutes of use.
+If it does, keep `sweetfb_hz=30` and drop `sweetcpufreq=1`.
+
 ### 3.1 Starting point
 
 Verified:
