@@ -50,6 +50,12 @@ PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
 # the touch bring-up: sweetfb_console=1 (keep the console on the panel instead
 # of the GUI), sweetts_nogpio/noclk/nose/norail=1, sweettouchdelay=<s>.
 CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=8 sweetsmp=1 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweetlog=1 sweettouch=1 sweetts=1 sweettouchdelay=20 sweetkeys=1 rpmhrsc=0x179e0000 rpmhtcs=0x179e0d00"}
+# The clock's floor (xnu 0174): the image's build time, so that an uncalibrated phone does not
+# start in 1970. A kernel without 0174 ignores it. Give sweetepoch= yourself to override.
+case " $CMDLINE " in
+*" sweetepoch="*) ;;
+*) CMDLINE="$CMDLINE sweetepoch=$(date -u +%s)" ;;
+esac
 
 [[ -f "$XNU_KERNEL" ]] || { echo "missing XNU kernel: $XNU_KERNEL" >&2; exit 1; }
 [[ -f "$DTB" ]] || { echo "missing stock DTB: $DTB (unpack the OnePlus boot.img first)" >&2; exit 1; }

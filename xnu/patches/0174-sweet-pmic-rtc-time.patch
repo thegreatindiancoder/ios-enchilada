@@ -1,0 +1,152 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -90,7 +90,8 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 &&
++	    peripheral != 0x60 /* RTC_RW: read only, SweetPlatformExpert */)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,11 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++
++extern "C" int sweet_spmi_init(void);
++extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -18,10 +23,105 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
++	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * Time of day. The Qualcomm PMIC's RTC (PM8998 on SDM845, PM6150 on SM7150: RTC_RW at SID 0,
++ * 0x6000, Linux rtc-pm8xxx "qcom,pm8941-rtc") counts seconds in RTC_RDATA0..3 (0x6048..0x604b,
++ * little-endian) since it was last reset, not since 1970: on phones its write registers belong
++ * to TrustZone, and Android keeps the epoch offset in its own files. This reads the counter once,
++ * when the platform expert starts (SPMI reads need thread context), and never writes the PMIC.
++ *
++ *   time = counter + sweetrtcoff, never earlier than sweetepoch
++ *
++ * sweetrtcoff (seconds) is this unit's offset; when iOS sets the clock (settimeofday), the line
++ * "SWEET RTC: ... sweetrtcoff=N" gives it. sweetepoch (UNIX seconds, the image's build time
++ * by default, tools/build-fajita.sh) keeps an uncalibrated phone out of 1970 so that
++ * certificate dates are not "not yet valid". Publishing IORTC also ends the 30 s wait for it
++ * in IOKitInitializeTime().
++ */
++static bool sweet_rtc_ok;
++static uint32_t sweet_rtc_counter;             /* RTC seconds when read */
++static uint64_t sweet_rtc_abs;                 /* mach_absolute_time() then */
++static int64_t sweet_rtc_offset;               /* boot-arg sweetrtcoff */
++static int64_t sweet_rtc_floor;                /* boot-arg sweetepoch */
++
++static int
++sweet_rtc_read(uint32_t *out)
++{
++	uint8_t ctrl = 0, b[4], again = 0;
++
++	if (sweet_spmi_init() != 0 || sweet_spmi_read(0, 0x6046, &ctrl) != 0) {
++		return -1;
++	}
++	if ((ctrl & 0x80) == 0) {
++		return -2;                             /* RTC_ENABLE clear: the counter is not running */
++	}
++	for (int tries = 0; tries < 3; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, 0x6048 + i, &b[i]) != 0) {
++				return -1;
++			}
++		}
++		/* the low byte again: a carry between the reads makes the four bytes inconsistent */
++		if (sweet_spmi_read(0, 0x6048, &again) != 0) {
++			return -1;
++		}
++		if (again == b[0]) {
++			*out = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++			return 0;
++		}
++	}
++	return -3;
++}
++
++static int64_t
++sweet_rtc_now(uint64_t *ns_out)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - sweet_rtc_abs, &ns);
++	if (ns_out != NULL) {
++		*ns_out = ns;
++	}
++	return (int64_t)sweet_rtc_counter + (int64_t)(ns / NSEC_PER_SEC);
++}
++
++void
++SweetPlatformExpert::getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs)
++{
++	uint64_t ns = 0;
++	int64_t t = sweet_rtc_floor;
++
++	*nsecs = 0;
++	if (sweet_rtc_ok) {
++		int64_t now = sweet_rtc_now(&ns) + sweet_rtc_offset;
++
++		if (now >= t) {
++			t = now;
++			*nsecs = (clock_nsec_t)(ns % NSEC_PER_SEC);
++		}
++	}
++	*secs = t > 0 ? (clock_sec_t)t : 0;
++}
++
++void
++SweetPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs)
++{
++	(void)nsecs;
++	if (!sweet_rtc_ok) {
++		return;
++	}
++	/* the PMIC is never written: keep the offset for this boot and say what it is */
++	sweet_rtc_offset = (int64_t)secs - sweet_rtc_now(NULL);
++	IOLog("SWEET RTC: time set to %lu; for this unit sweetrtcoff=%lld\n", (unsigned long)secs,
++	    (long long)sweet_rtc_offset);
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -29,6 +129,19 @@ SweetPlatformExpert::start(IOService *provider)
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	{
++		int err;
++
++		(void)PE_parse_boot_argn("sweetrtcoff", &sweet_rtc_offset, sizeof(sweet_rtc_offset));
++		(void)PE_parse_boot_argn("sweetepoch", &sweet_rtc_floor, sizeof(sweet_rtc_floor));
++		err = sweet_rtc_read(&sweet_rtc_counter);
++		sweet_rtc_abs = mach_absolute_time();
++		sweet_rtc_ok = err == 0;
++		IOLog("SWEET RTC: %s %u, sweetrtcoff=%lld sweetepoch=%lld\n",
++		    sweet_rtc_ok ? "counter" : "no counter, error", sweet_rtc_ok ? sweet_rtc_counter : (unsigned)-err,
++		    (long long)sweet_rtc_offset, (long long)sweet_rtc_floor);
++		publishResource("IORTC", this);
++	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
