@@ -45,12 +45,17 @@ Not carried over: hackios also fills one entry of CoreAnimation's shader-source 
 (20F66 `0x1d5b54790`, the single-pass blur "sb3"); their own notes record no visible effect, so a
 first version leaves it out.
 
+## The EAGL macro-context table is unchanged
+
+Every exported `gl*` function of OpenGLES does
+`mrs x8, tpidrro_el0; ldr x8, [x8, #240]; …; ldr xF, [x8, #N]; ldr x0, [x8, #32]; br/blr xF`:
+the context comes from thread-local storage, the function from field `N`, and the first argument
+from field `0x20`. hackios' `userland/src/eagl_slots.txt` (20F66) counts entries from that
+`+0x20`. `tools/dsc-gles-slots.py` reads the same thing off the 20H392 cache and compares:
+**all 457 names, same offsets, nothing moved or missing.** The hackios table can be used as is.
+
 ## Still to do for 20H392
 
-- The `-[EAGLContext getMacroContextPrivate]` function table: hackios lists 414 offsets for
-  20F66 OpenGLES (`userland/src/eagl_slots.txt`), read off each `gl*` function's
-  thread-local-storage load. OpenGLES is a frozen framework, so the offsets are expected to be the
-  same in 20H392; to be checked the same way before the first boot that uses them.
 - The libdrm stand-in for `SweetAdreno630` (Bergamota `gpu/freedreno-sweet/sweet_drm.c`, already
   built for this port by the 6T tree) and the IOSurface-to-BO import (`0x71 SURFACE_BO` here,
   `0x7e` in hackios).
