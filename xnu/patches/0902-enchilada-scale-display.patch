@@ -1,0 +1,156 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -104,6 +104,10 @@
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScale;                   /* 0902: sweetfb_scale=1 */
++	bool          fMarginsCleared;
++	uint32_t      fScaledW, fScaledH, fMarginX, fMarginY;
++	uint16_t     *fColMap, *fRowMap;        /* panel column/row -> presented column/row */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -195,6 +199,44 @@
+ 	int offy = -1;
+ 	if (PE_parse_boot_argn("sweetfb_offy", &offy, sizeof(offy)) && offy >= 0 && offy <= (int)(fLogicalH - fHeight)) {
+ 		fOffY = offy;
++	}
++	/* 0902: sweetfb_scale=1 fits the whole presented display into the panel (nearest
++	 * neighbour) instead of cropping it, so the status bar, the dock and the home indicator
++	 * all stay visible. hid/SweetHID.cpp maps the digitizer with the same arithmetic. */
++	uint32_t scale = 0;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	if (scale != 0 && (fLogicalW > fWidth || fLogicalH > fHeight)) {
++		if ((uint64_t)fWidth * fLogicalH <= (uint64_t)fHeight * fLogicalW) {
++			fScaledW = fWidth;
++			fScaledH = (uint32_t)((uint64_t)fLogicalH * fWidth / fLogicalW);
++		} else {
++			fScaledH = fHeight;
++			fScaledW = (uint32_t)((uint64_t)fLogicalW * fHeight / fLogicalH);
++		}
++		fMarginX = (fWidth - fScaledW) / 2;
++		fMarginY = (fHeight - fScaledH) / 2;
++		fColMap = (uint16_t *)IOMallocData(fScaledW * sizeof(uint16_t));
++		fRowMap = (uint16_t *)IOMallocData(fScaledH * sizeof(uint16_t));
++		if (fColMap != NULL && fRowMap != NULL) {
++			for (uint32_t i = 0; i < fScaledW; i++) {
++				fColMap[i] = (uint16_t)(((uint64_t)(2 * i + 1) * fLogicalW) / (2 * (uint64_t)fScaledW));
++			}
++			for (uint32_t j = 0; j < fScaledH; j++) {
++				fRowMap[j] = (uint16_t)(((uint64_t)(2 * j + 1) * fLogicalH) / (2 * (uint64_t)fScaledH));
++			}
++			fScale = true;
++			IOLog("SWEET FB: scaled %ux%u into %ux%u at %u,%u\n", fLogicalW, fLogicalH, fScaledW, fScaledH, fMarginX, fMarginY);
++		} else {
++			if (fColMap != NULL) {
++				IOFreeData(fColMap, fScaledW * sizeof(uint16_t));
++				fColMap = NULL;
++			}
++			if (fRowMap != NULL) {
++				IOFreeData(fRowMap, fScaledH * sizeof(uint16_t));
++				fRowMap = NULL;
++			}
++			IOLog("SWEET FB: sweetfb_scale: no memory for the maps, cropping instead\n");
++		}
+ 	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+@@ -429,6 +471,60 @@
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
++		}
++		if (fScale) {
++			/* 0902: presented display -> panel through the row and column maps */
++			if (sx < 0 || sy < 0) {
++				sx = sy = 0;
++			}
++			if (dx < 0 || dy < 0) {
++				dx = dy = 0;
++			}
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			if (w > (int32_t)fLogicalW - dx) {
++				w = (int32_t)fLogicalW - dx;
++			}
++			if (h > (int32_t)fLogicalH - dy) {
++				h = (int32_t)fLogicalH - dy;
++			}
++			uint64_t end = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 4;
++			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 && s->elementHeight == 1 &&
++			    s->memory != NULL && end <= s->memory->getLength()) {
++				if (!fMarginsCleared) {
++					/* the bars beside the scaled picture still hold the boot console */
++					fMarginsCleared = true;
++					for (uint32_t y = 0; y < fHeight; y++) {
++						uint8_t *row = (uint8_t *)(fPixels + (uint64_t)y * fRowBytes);
++						if (y < fMarginY || y >= fMarginY + fScaledH) {
++							bzero(row, (size_t)fWidth * 4);
++							continue;
++						}
++						bzero(row, (size_t)fMarginX * 4);
++						bzero(row + (uint64_t)(fMarginX + fScaledW) * 4, (size_t)(fWidth - fMarginX - fScaledW) * 4);
++					}
++				}
++				for (uint32_t j = 0; j < fScaledH; j++) {
++					int32_t ly = fRowMap[j];
++					if (ly < dy || ly >= dy + h) {
++						continue;
++					}
++					const uint32_t *srow = (const uint32_t *)(src + s->offset + (uint64_t)(sy + ly - dy) * s->bytesPerRow);
++					uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)(fMarginY + j) * fRowBytes) + fMarginX;
++					for (uint32_t i = 0; i < fScaledW; i++) {
++						int32_t lx = fColMap[i];
++						if (lx >= dx && lx < dx + w) {
++							drow[i] = srow[sx + lx - dx];
++						}
++					}
++				}
++			}
++			s->release();
++			continue;
+ 		}
+ 		if (sx < 0 || sy < 0) {
+ 			sx = sy = 0;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -455,6 +455,24 @@
+ 	if (PE_parse_boot_argn("sweetfb_offy", &offy, sizeof(offy)) && offy >= 0 && offy <= fLogicalH - panelH) {
+ 		fOffY = offy;
+ 	}
++	/* 0902: sweetfb_scale=1 -- the panel shows the whole presented display scaled into it
++	 * (SweetFramebuffer.cpp, same arithmetic): normalised position = (panel - margin) / scaled. */
++	uint32_t scale = 0;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	if (scale != 0 && !native && (fLogicalW > panelW || fLogicalH > panelH)) {
++		int scaledW, scaledH;
++		if ((int64_t)panelW * fLogicalH <= (int64_t)panelH * fLogicalW) {
++			scaledW = panelW;
++			scaledH = (int)((int64_t)fLogicalH * panelW / fLogicalW);
++		} else {
++			scaledH = panelH;
++			scaledW = (int)((int64_t)fLogicalW * panelH / fLogicalH);
++		}
++		fOffX = -((panelW - scaledW) / 2);
++		fOffY = -((panelH - scaledH) / 2);
++		fLogicalW = scaledW;
++		fLogicalH = scaledH;
++	}
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -484,6 +502,9 @@
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+ 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+ 	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	/* 0902: with sweetfb_scale the black bars lie outside the display: clamp to it */
++	nx = nx < 0 ? 0 : (nx > 0xffff ? 0xffff : nx);
++	ny = ny < 0 ? 0 : (ny > 0xffff ? 0xffff : ny);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
